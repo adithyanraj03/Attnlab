@@ -1,0 +1,6 @@
+/node_modules/
+/dist/
+report.html
+*.test-output
+Deleted_files/
+_future-pushes/
