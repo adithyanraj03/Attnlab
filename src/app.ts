@@ -115,6 +115,7 @@ function render(r: ReturnType<typeof forward>, row: number): string {
 }
 
 function refresh(): void {
+  if (typeof document === "undefined") return; // no DOM (node tests)
   const r = forward(state.cfg);
   last = r;
   const stage = document.getElementById("al-stage");
@@ -142,6 +143,7 @@ function wireControls(): void {
 }
 
 function init(): void {
+  if (typeof document === "undefined") return; // no DOM (node tests)
   const app = document.getElementById("al-root");
   if (!app) return;
   const st = document.createElement("style");
@@ -167,7 +169,7 @@ export const Attnlab = {
   refresh,
   selectRow(i: number): void {
     state.row = i;
-    if (last) {
+    if (last && typeof document !== "undefined") {
       const stage = document.getElementById("al-stage");
       if (stage) stage.innerHTML = render(last, i);
     }
@@ -182,4 +184,6 @@ declare global {
     Attnlab: typeof Attnlab;
   }
 }
-(window as Window).Attnlab = Attnlab;
+if (typeof window !== "undefined") {
+  (window as Window).Attnlab = Attnlab;
+}
