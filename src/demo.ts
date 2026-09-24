@@ -40,6 +40,6 @@ export function runDemo(cfg: PlaygroundConfig = DEFAULT_CONFIG): string {
   }
 
   L.push(sep);
-  L.push("deterministic: same seed ⇒ identical matrix (verified by the test suite)");
+  L.push("deterministic: same seed → identical matrix (verified by the test suite)");
   return L.join("\n");
 }
