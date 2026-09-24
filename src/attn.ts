@@ -11,27 +11,28 @@ export interface AttentionSettings {
   causal: boolean; // mask the future (j > i) to zero
 }
 
-/** Single-head scaled dot-product attention. q, k, v: (N×d). Returns (N×N)
- * row-stochastic weights and the (N×dv) output. */
+/** Single-head scaled dot-product attention. q: (Nq×d), k: (Nk×d), v: (Nk×dv).
+ * The weight matrix is (Nq×Nk); causal masking requires Nq = Nk. */
 export function attention(q: Mat, k: Mat, v: Mat, s: AttentionSettings): AttentionResult {
-  if (q.r !== k.r) throw new Error("attention: q/k row mismatch");
   if (q.c !== k.c) throw new Error("attention: q/k dim mismatch");
   if (k.r !== v.r) throw new Error("attention: k/v row mismatch");
-  const n = q.r;
+  if (s.causal && q.r !== k.r) throw new Error("attention: causal requires Nq = Nk");
+  const nq = q.r;
+  const nk = k.r;
   const d = q.c;
   const scale = Math.sqrt(d) * s.temperature;
   let scores = matmul(q, transpose(k));
   // divide in place
   for (let i = 0; i < scores.a.length; i++) scores.a[i] /= scale;
-  const mask = s.causal ? causalMask(n) : null;
-  const weights = mat(n, n);
-  for (let i = 0; i < n; i++) {
-    const logit = scores.a.slice(i * n, (i + 1) * n);
+  const mask = s.causal ? causalMask(nq) : null;
+  const weights = mat(nq, nk);
+  for (let i = 0; i < nq; i++) {
+    const logit = scores.a.slice(i * nk, (i + 1) * nk);
     if (mask) {
-      for (let j = 0; j < n; j++) if (!mask[i][j]) logit[j] = -Infinity;
+      for (let j = 0; j < nk; j++) if (!mask[i][j]) logit[j] = -Infinity;
     }
     const w = softmax(logit, 1); // logits are already temperature-scaled
-    for (let j = 0; j < n; j++) weights.a[i * n + j] = w[j];
+    for (let j = 0; j < nk; j++) weights.a[i * nk + j] = w[j];
   }
   return { weights, out: matmul(weights, v) };
 }

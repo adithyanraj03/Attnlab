@@ -4,33 +4,29 @@ import { fromRows, get } from "../dist/mat.js";
 import { attention, multiHead } from "../dist/attn.js";
 
 // Hand-computed single-head example (softmax worked out by hand here, not via the library).
-// q = k = identity(2), v=[[10,0],[0,20]]  d=2  T=1
-// scores = identity; scale = sqrt(2); scaled rows = [1/√2, 0] and [0, 1/√2]
-// weights rows = [e^{1/√2}, 1] / (e^{1/√2} + 1) and its transpose
+// q=[[1,0]]  k=[[1,0],[0,1]]  v=[[10,0],[0,20]]  d=2  T=1
+// scores = q k^T = [1,0]; scale = sqrt(2); scaled = [1/√2, 0]
+// weights = [e^{1/√2}, 1] / (e^{1/√2} + 1)
 test("single-head attention matches the hand computation", () => {
-  const q = fromRows([[1, 0], [0, 1]]);
+  const q = fromRows([[1, 0]]);
   const k = fromRows([[1, 0], [0, 1]]);
   const v = fromRows([[10, 0], [0, 20]]);
   const e = Math.exp(1 / Math.SQRT2);
   const w0 = e / (e + 1);
   const w1 = 1 / (e + 1);
   const res = attention(q, k, v, { temperature: 1, causal: false });
-  assert.ok(Math.abs(res.weights.a[0] - w0) < 1e-12, `w00=${res.weights.a[0]} want ${w0}`);
-  assert.ok(Math.abs(res.weights.a[1] - w1) < 1e-12, `w01=${res.weights.a[1]} want ${w1}`);
-  assert.ok(Math.abs(res.weights.a[2] - w1) < 1e-12, `w10=${res.weights.a[2]} want ${w1}`);
-  assert.ok(Math.abs(res.weights.a[3] - w0) < 1e-12, `w11=${res.weights.a[3]} want ${w0}`);
+  assert.ok(Math.abs(res.weights.a[0] - w0) < 1e-12, `w0=${res.weights.a[0]} want ${w0}`);
+  assert.ok(Math.abs(res.weights.a[1] - w1) < 1e-12, `w1=${res.weights.a[1]} want ${w1}`);
   assert.ok(Math.abs(res.out.a[0] - w0 * 10) < 1e-12, `out0=${res.out.a[0]}`);
   assert.ok(Math.abs(res.out.a[1] - w1 * 20) < 1e-12, `out1=${res.out.a[1]}`);
-  assert.ok(Math.abs(res.out.a[2] - w1 * 10) < 1e-12, `out2=${res.out.a[2]}`);
-  assert.ok(Math.abs(res.out.a[3] - w0 * 20) < 1e-12, `out3=${res.out.a[3]}`);
 });
 
 test("attention weights are row-stochastic", () => {
-  const q = fromRows([[1, 0], [0, 1], [1, 1]]);
+  const q = fromRows([[1, 0], [0, 1]]);
   const k = fromRows([[1, 0], [0, 1], [1, 1]]);
   const v = fromRows([[1, 0], [0, 1], [1, 1]]);
   const res = attention(q, k, v, { temperature: 1, causal: false });
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < 2; i++) {
     const s = get(res.weights, i, 0) + get(res.weights, i, 1) + get(res.weights, i, 2);
     assert.ok(Math.abs(s - 1) < 1e-9, `row ${i} sums to ${s}`);
   }
@@ -55,7 +51,7 @@ test("causal mask zeroes the future and leaves row 0 at its own key", () => {
 });
 
 test("larger temperature increases row entropy (flattens)", () => {
-  const q = fromRows([[3, 0], [0, 3], [1, 1]]);
+  const q = fromRows([[3, 0]]);
   const k = fromRows([[1, 0], [0.9, 0], [0.1, 0]]);
   const v = fromRows([[1, 0], [1, 0], [1, 0]]);
   const ent = (t) => {
