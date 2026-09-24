@@ -7,7 +7,7 @@ const ORDER = ["prng", "mat", "attn", "svg", "model", "app"];
 let js = "";
 for (const name of ORDER) {
   let src = readFileSync(`dist/${name}.js`, "utf8");
-  src = src.replace(/^\s*import[\s\S]*?from\s*["'][^"']+["'];/g, "");
+  src = src.replace(/^\s*import[\s\S]*?from\s*["'][^"']+["'];/gm, "");
   src = src.replace(/^export\s+/gm, "");
   js += `// ---- ${name} ----\n${src}\n\n`;
 }

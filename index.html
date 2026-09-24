@@ -1,0 +1,699 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Attnlab — attention playground</title>
+</head>
+<body>
+<div id="al-root"></div>
+<script>// ---- prng ----
+// SplitMix64 — the same stream family the VecLab (Rust) and Strainlab (Go)
+// projects use, so the whole lab behaves like one instrument. JavaScript
+// numbers are 53-bit, so the 64-bit mixing runs on BigInt; everything else
+// consumes plain numbers.
+const SM_INC = 0x9e3779b97f4a7c15n;
+const SM_M1 = 0xbf58476d1ce4e5b9n;
+const SM_M2 = 0x94d049bb133111ebn;
+const U64_MAX = (1n << 64n) - 1n;
+class Rng {
+    s;
+    constructor(seed) {
+        this.s = BigInt(seed) & U64_MAX;
+    }
+    /** Current state — fully determines the remaining stream. */
+    state() {
+        return this.s;
+    }
+    /** Next full 64-bit SplitMix64 output. */
+    nextU64() {
+        this.s = (this.s + SM_INC) & U64_MAX;
+        let z = this.s;
+        z = ((z ^ (z >> 30n)) * SM_M1) & U64_MAX;
+        z = ((z ^ (z >> 27n)) * SM_M2) & U64_MAX;
+        return (z ^ (z >> 31n)) & U64_MAX;
+    }
+    /** Uniform float in [0, 1) with 53 bits of resolution. */
+    nextFloat() {
+        return Number(this.nextU64() >> 11n) / 2 ** 53;
+    }
+    /** Uniform integer in [0, n). Throws for n <= 0.
+     * Rejection sampling on the low 32 bits keeps bias under 1e-9. */
+    nextInt(n) {
+        if (!Number.isInteger(n) || n <= 0)
+            throw new Error("Rng.nextInt: n must be a positive integer");
+        const mod = 2 ** 32;
+        const limit = mod - (mod % n);
+        for (;;) {
+            const x = Number(this.nextU64() & 0xffffffffn);
+            if (x < limit)
+                return x % n;
+        }
+    }
+    /** Standard normal via Box-Muller (cosine branch), same convention as
+     * the Rust and Go ports. */
+    nextGaussian() {
+        const u = this.nextFloat();
+        const v = this.nextFloat();
+        return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    }
+    /** Uniform in [-1, 1). */
+    nextSpan() {
+        return this.nextFloat() * 2 - 1;
+    }
+}
+
+
+// ---- mat ----
+// Hand-rolled matrix math. Row-major Float64Array storage, no dependency.
+// Every operation is a pure function of its inputs.
+function mat(r, c) {
+    if (!Number.isInteger(r) || !Number.isInteger(c) || r < 0 || c < 0) {
+        throw new Error(`mat: invalid dimensions ${r}x${c}`);
+    }
+    return { r, c, a: new Float64Array(r * c) };
+}
+function fromRows(rows) {
+    const r = rows.length;
+    const c = rows[0]?.length ?? 0;
+    const m = mat(r, c);
+    for (let i = 0; i < r; i++) {
+        if (rows[i].length !== c)
+            throw new Error(`fromRows: ragged row ${i}`);
+        for (let j = 0; j < c; j++)
+            m.a[i * c + j] = rows[i][j];
+    }
+    return m;
+}
+function matmul(x, y) {
+    if (x.c !== y.r)
+        throw new Error(`matmul: ${x.r}x${x.c} * ${y.r}x${y.c}`);
+    const out = mat(x.r, y.c);
+    for (let i = 0; i < x.r; i++) {
+        const xo = i * x.c;
+        const oo = i * y.c;
+        for (let k = 0; k < x.c; k++) {
+            const xik = x.a[xo + k];
+            if (xik === 0)
+                continue;
+            const yo = k * y.c;
+            for (let j = 0; j < y.c; j++)
+                out.a[oo + j] += xik * y.a[yo + j];
+        }
+    }
+    return out;
+}
+function addm(x, y) {
+    if (x.r !== y.r || x.c !== y.c)
+        throw new Error("addm: dimension mismatch");
+    const out = mat(x.r, x.c);
+    for (let i = 0; i < x.a.length; i++)
+        out.a[i] = x.a[i] + y.a[i];
+    return out;
+}
+function scalem(x, s) {
+    const out = mat(x.r, x.c);
+    for (let i = 0; i < x.a.length; i++)
+        out.a[i] = x.a[i] * s;
+    return out;
+}
+function transpose(x) {
+    const out = mat(x.c, x.r);
+    for (let i = 0; i < x.r; i++) {
+        for (let j = 0; j < x.c; j++)
+            out.a[j * x.r + i] = x.a[i * x.c + j];
+    }
+    return out;
+}
+/** Copy of row i (a fresh Float64Array; mutation never touches the source). */
+function row(x, i) {
+    if (i < 0 || i >= x.r)
+        throw new Error(`row: index ${i} out of range`);
+    return x.a.slice(i * x.c, (i + 1) * x.c);
+}
+/** x[i, j] */
+function get(x, i, j) {
+    return x.a[i * x.c + j];
+}
+/**
+ * Stable softmax of one row of logits, scaled by 1/temperature.
+ * Temperature must be > 0. As temperature grows the result approaches
+ * uniform; as it shrinks it approaches the argmax one-hot.
+ */
+function softmax(logits, temperature) {
+    if (temperature <= 0)
+        throw new Error("softmax: temperature must be > 0");
+    const out = new Float64Array(logits.length);
+    let max = -Infinity;
+    for (let j = 0; j < logits.length; j++) {
+        if (logits[j] > max)
+            max = logits[j];
+    }
+    let sum = 0;
+    for (let j = 0; j < logits.length; j++) {
+        const e = Math.exp((logits[j] - max) / temperature);
+        out[j] = e;
+        sum += e;
+    }
+    if (sum === 0 || !Number.isFinite(sum))
+        throw new Error("softmax: no finite mass (all -Infinity?)");
+    for (let j = 0; j < logits.length; j++)
+        out[j] /= sum;
+    return out;
+}
+/** True where j >= i (the allowed "past" region for a causal row i). */
+function causalMask(n) {
+    const m = [];
+    for (let i = 0; i < n; i++) {
+        const rowm = [];
+        for (let j = 0; j < n; j++)
+            rowm.push(j <= i);
+        m.push(rowm);
+    }
+    return m;
+}
+/** First index of the maximum (ties go to the lowest index — deterministic). */
+function argmax(v) {
+    let bi = 0;
+    for (let j = 1; j < v.length; j++)
+        if (v[j] > v[bi])
+            bi = j;
+    return bi;
+}
+/** Shannon entropy in nats; 0·log(0) is 0 by convention. */
+function entropy(v) {
+    let h = 0;
+    for (let j = 0; j < v.length; j++) {
+        const p = v[j];
+        if (p > 0)
+            h -= p * Math.log(p);
+    }
+    return h;
+}
+
+
+// ---- attn ----
+// The attention mechanism itself, nothing else:
+//   weights = softmax(Q Kᵀ / (√d · T))   (causal mask → -Infinity)
+//   output  = weights · V
+// where d is the key dimension. Multi-head attention runs this per head on
+// projected features and concatenates the per-head outputs.
+
+/** Single-head scaled dot-product attention. q: (Nq×d), k: (Nk×d), v: (Nk×dv).
+ * The weight matrix is (Nq×Nk); causal masking requires Nq = Nk. */
+function attention(q, k, v, s) {
+    if (q.c !== k.c)
+        throw new Error("attention: q/k dim mismatch");
+    if (k.r !== v.r)
+        throw new Error("attention: k/v row mismatch");
+    if (s.causal && q.r !== k.r)
+        throw new Error("attention: causal requires Nq = Nk");
+    const nq = q.r;
+    const nk = k.r;
+    const d = q.c;
+    const scale = Math.sqrt(d) * s.temperature;
+    let scores = matmul(q, transpose(k));
+    // divide in place
+    for (let i = 0; i < scores.a.length; i++)
+        scores.a[i] /= scale;
+    const mask = s.causal ? causalMask(nq) : null;
+    const weights = mat(nq, nk);
+    for (let i = 0; i < nq; i++) {
+        const logit = scores.a.slice(i * nk, (i + 1) * nk);
+        if (mask) {
+            for (let j = 0; j < nk; j++)
+                if (!mask[i][j])
+                    logit[j] = -Infinity;
+        }
+        const w = softmax(logit, 1); // logits are already temperature-scaled
+        for (let j = 0; j < nk; j++)
+            weights.a[i * nk + j] = w[j];
+    }
+    return { weights, out: matmul(weights, v) };
+}
+/**
+ * Multi-head attention. x: (N×d); per-head projections wq, wk: (d×d_h),
+ * wv: (d×d_h). head h runs attention on (x·wq_h, x·wk_h, x·wv_h); the
+ * output concatenates the per-head outputs → (N × heads·d_h).
+ */
+function multiHead(x, wq, wk, wv, heads, s) {
+    if (wq.length !== heads || wk.length !== heads || wv.length !== heads) {
+        throw new Error("multiHead: projection count must equal heads");
+    }
+    const n = x.r;
+    const perHead = [];
+    const qAll = [];
+    const kAll = [];
+    const vAll = [];
+    const outCols = [];
+    for (let h = 0; h < heads; h++) {
+        if (wq[h].r !== x.c || wk[h].r !== x.c || wv[h].r !== x.c) {
+            throw new Error(`multiHead: head ${h} projection width ${x.c} mismatch`);
+        }
+        const q = matmul(x, wq[h]);
+        const k = matmul(x, wk[h]);
+        const v = matmul(x, wv[h]);
+        const res = attention(q, k, v, s);
+        qAll.push(q);
+        kAll.push(k);
+        vAll.push(v);
+        perHead.push(res);
+        outCols.push(v.c);
+    }
+    const out = mat(n, outCols.reduce((a, b) => a + b, 0));
+    let col = 0;
+    for (let h = 0; h < heads; h++) {
+        const w = perHead[h].out;
+        for (let i = 0; i < n; i++) {
+            for (let j = 0; j < w.c; j++)
+                out.a[i * out.c + col + j] = w.a[i * w.c + j];
+        }
+        col += w.c;
+    }
+    return { perHead, q: qAll, k: kAll, v: vAll, weights: perHead[0].weights, out };
+}
+
+
+// ---- svg ----
+// SVG builders shared by the interactive app and the static report.
+// Pure string functions of their inputs — the same weights always render
+// the same bytes.
+
+const PAPER = "#f7f6f1";
+const CELL_LO = [241, 240, 234]; // near-paper
+const CELL_HI = [45, 40, 124]; // deep indigo
+const MASK_FILL = "#fbfaf7";
+const INK = "#252524";
+const MUTED = "#676662";
+function lerp(a, b, t) {
+    return a + (b - a) * t;
+}
+function heatColor(w) {
+    const t = Math.max(0, Math.min(1, w));
+    const r = Math.round(lerp(CELL_LO[0], CELL_HI[0], t));
+    const g = Math.round(lerp(CELL_LO[1], CELL_HI[1], t));
+    const b = Math.round(lerp(CELL_LO[2], CELL_HI[2], t));
+    return `rgb(${r},${g},${b})`;
+}
+/**
+ * An attention heatmap: rows = query positions, columns = key positions.
+ * `tokens` supplies the labels (one per position).
+ */
+function heatmapSVG(weights, tokens, opts) {
+    const { cell, causal, labels } = opts;
+    const fs = opts.fontSize ?? Math.max(9, Math.round(cell * 0.3));
+    const n = weights.r;
+    const pad = labels ? cell * 0.9 + 4 : 2;
+    const w = pad + n * cell + 2;
+    const h = pad + n * cell + 2;
+    let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" font-family="ui-monospace, Menlo, Consolas, monospace">`;
+    s += `<rect x="0" y="0" width="${w}" height="${h}" fill="${PAPER}"/>`;
+    if (labels) {
+        for (let j = 0; j < n; j++) {
+            s += `<text x="${pad + j * cell + cell / 2}" y="${pad - 6}" font-size="${fs}" fill="${MUTED}" text-anchor="middle">${esc(tokens[j])}</text>`;
+        }
+        for (let i = 0; i < n; i++) {
+            s += `<text x="${pad - 6}" y="${pad + i * cell + cell / 2 + fs / 3}" font-size="${fs}" fill="${MUTED}" text-anchor="end">${esc(tokens[i])}</text>`;
+        }
+    }
+    for (let i = 0; i < n; i++) {
+        for (let j = 0; j < n; j++) {
+            const x = pad + j * cell;
+            const y = pad + i * cell;
+            const masked = causal && j > i;
+            const fill = masked ? MASK_FILL : heatColor(get(weights, i, j));
+            s += `<rect x="${x + 0.5}" y="${y + 0.5}" width="${cell - 1}" height="${cell - 1}" fill="${fill}"/>`;
+        }
+    }
+    if (opts.selectedRow !== undefined && opts.selectedRow >= 0 && opts.selectedRow < n) {
+        const y = pad + opts.selectedRow * cell;
+        s += `<rect x="${pad - 1}" y="${y - 1}" width="${n * cell + 2}" height="${cell + 2}" fill="none" stroke="${INK}" stroke-width="1.5"/>`;
+    }
+    if (opts.rowClick) {
+        for (let i = 0; i < n; i++) {
+            const y = pad + i * cell;
+            s += `<rect x="${pad}" y="${y}" width="${n * cell}" height="${cell}" fill="transparent" onclick="${opts.rowClick(i)}"/>`;
+        }
+    }
+    s += `</svg>`;
+    return s;
+}
+function barsSVG(values, tokens, color) {
+    const n = values.length;
+    const rowH = 22;
+    const labelW = 54;
+    const maxW = 300;
+    const w = labelW + maxW + 56;
+    const h = n * rowH + 8;
+    let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" font-family="ui-monospace, Menlo, Consolas, monospace">`;
+    for (let j = 0; j < n; j++) {
+        const y = 4 + j * rowH;
+        const bw = Math.max(1, values[j] * maxW);
+        s += `<text x="${labelW - 8}" y="${y + 13}" font-size="11" fill="${MUTED}" text-anchor="end">${esc(tokens[j])}</text>`;
+        s += `<rect x="${labelW}" y="${y + 4}" width="${bw}" height="12" fill="${color}"/>`;
+        s += `<text x="${labelW + bw + 6}" y="${y + 13}" font-size="11" fill="${INK}">${values[j].toFixed(3)}</text>`;
+    }
+    s += `</svg>`;
+    return s;
+}
+function esc(t) {
+    return t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+
+// ---- model ----
+// The playground model: deterministic scenarios, designed or random head
+// initializations, and the full forward pass. Pure functions of (config,
+// seed) — no wall clock, no Math.random.
+
+
+
+const SCENARIOS = [
+    { name: "narrative", tokens: ["the", "cat", "sat", "on", "the", "mat", "the", "dog", "bit", "the", "cat", "tail"] },
+    { name: "alternating", tokens: ["a", "b", "a", "c", "b", "a", "c", "b", "a", "c", "b", "a"] },
+    { name: "blocks", tokens: ["a", "a", "a", "b", "b", "b", "c", "c", "c", "a", "b", "c"] },
+];
+function scenarioTokens(name) {
+    const sc = SCENARIOS.find((s) => s.name === name);
+    if (!sc)
+        throw new Error(`unknown scenario ${name}`);
+    return sc.tokens;
+}
+const DEFAULT_CONFIG = {
+    scenario: "narrative",
+    seed: 7,
+    heads: 3,
+    headDim: 8,
+    temperature: 1,
+    causal: true,
+    preset: "structured",
+};
+/** Which heads the structured preset plans for a given head count. */
+function headPlan(cfg) {
+    const plans = [];
+    const k = cfg.heads;
+    if (cfg.preset === "random") {
+        for (let h = 0; h < k; h++)
+            plans.push({ name: `random ${h}`, kind: "random" });
+        return plans;
+    }
+    // structured
+    if (k >= 2)
+        plans.push({ name: "recency", kind: "recency" });
+    plans.push({ name: "type", kind: "type" });
+    let r = 0;
+    while (plans.length < k)
+        plans.push({ name: `random ${r++}`, kind: "random" });
+    return plans.slice(0, k);
+}
+const POS_DIMS = 3; // [pos, pos², 1]
+const RECENCY_S = 2; // recency head score scale
+const TYPE_SCALE = 3; // type head score scale (same-type score = 9)
+function forward(cfg) {
+    if (cfg.heads < 1 || cfg.heads > 4)
+        throw new Error("heads must be 1..4");
+    if (cfg.headDim < 4 || cfg.headDim > 16)
+        throw new Error("headDim must be 4..16");
+    if (cfg.temperature <= 0)
+        throw new Error("temperature must be > 0");
+    const tokens = scenarioTokens(cfg.scenario);
+    const vocab = [...new Set(tokens)].sort();
+    const vocabSize = vocab.length;
+    const typeOf = tokens.map((t) => vocab.indexOf(t));
+    const n = tokens.length;
+    const d = vocabSize + POS_DIMS;
+    const dH = cfg.headDim;
+    // x = [onehot type (vocab) | pos (3)]
+    const x = mat(n, d);
+    for (let i = 0; i < n; i++) {
+        x.a[i * d + typeOf[i]] = 1;
+        const p = i / n;
+        x.a[i * d + vocabSize + 0] = p;
+        x.a[i * d + vocabSize + 1] = p * p;
+        x.a[i * d + vocabSize + 2] = 1;
+    }
+    const plans = headPlan(cfg);
+    const rng = new Rng(cfg.seed);
+    // Draw every projection first (fixed draw order), then override the
+    // structured heads — so random heads are identical no matter which
+    // structured heads are present.
+    const wq = [];
+    const wk = [];
+    const wv = [];
+    for (let h = 0; h < plans.length; h++) {
+        const q = mat(d, dH);
+        const k = mat(d, dH);
+        const v = mat(d, dH);
+        for (let i = 0; i < q.a.length; i++)
+            q.a[i] = rng.nextGaussian();
+        for (let i = 0; i < k.a.length; i++)
+            k.a[i] = rng.nextGaussian();
+        for (let i = 0; i < v.a.length; i++)
+            v.a[i] = rng.nextGaussian();
+        wq.push(q);
+        wk.push(k);
+        wv.push(v);
+    }
+    const sq = Math.sqrt(RECENCY_S);
+    plans.forEach((plan, h) => {
+        if (plan.kind === "recency") {
+            wq[h].a.fill(0);
+            wk[h].a.fill(0);
+            const p0 = vocabSize, p1 = vocabSize + 1, p2 = vocabSize + 2;
+            wq[h].a[p0 * dH + 0] = Math.sqrt(2 * RECENCY_S); // q dim0 ← pos
+            wq[h].a[p2 * dH + 1] = sq; // q dim1 ← bias
+            wk[h].a[p0 * dH + 0] = sq; // k dim0 ← pos
+            wk[h].a[p1 * dH + 1] = -sq; // k dim1 ← pos²
+            // score(i,j) = (S/n²)·(i² − (i−j)²): a Gaussian window over the past
+        }
+        else if (plan.kind === "type") {
+            wq[h].a.fill(0);
+            wk[h].a.fill(0);
+            for (let r = 0; r < Math.min(vocabSize, dH); r++) {
+                wq[h].a[r * dH + r] = TYPE_SCALE;
+                wk[h].a[r * dH + r] = TYPE_SCALE;
+            }
+            // same-type score = 9, cross-type score = 0 (exactly)
+        }
+    });
+    const multi = multiHead(x, wq, wk, wv, plans.length, {
+        temperature: cfg.temperature,
+        causal: cfg.causal,
+    });
+    const entropies = [];
+    const peaks = [];
+    for (let h = 0; h < plans.length; h++) {
+        const w = multi.perHead[h].weights;
+        let sum = 0;
+        for (let i = 0; i < w.r; i++)
+            sum += entropy(w.a.slice(i * w.c, (i + 1) * w.c));
+        entropies.push(sum / w.r);
+        let bi = 0, bj = 0;
+        for (let i = 0; i < w.r; i++) {
+            for (let j = 0; j < w.c; j++) {
+                if (get(w, i, j) > get(w, bi, bj)) {
+                    bi = i;
+                    bj = j;
+                }
+            }
+        }
+        peaks.push({ row: bi, col: bj, value: get(w, bi, bj) });
+    }
+    return {
+        cfg, tokens, vocab, typeOf, n, d, headDim: dH, heads: plans.length,
+        x, wq, wk, wv, plans, multi, entropies, peaks,
+    };
+}
+// convenience used by demo + report
+function fmtW(v, decimals = 3) {
+    return v.toFixed(decimals);
+}
+function tokenColor(typeIndex) {
+    const palette = ["#5B51C7", "#22AC80", "#A74221", "#E8833A", "#4A5568", "#9B5C8E", "#3D7A8C", "#7A6A2F"];
+    return palette[typeIndex % palette.length];
+}
+
+
+// ---- app ----
+// The interactive playground. Builds its own DOM, recomputes the full
+// forward pass on every control change, and renders SVG heatmaps. No
+// Math.random anywhere: even the "reseed" button steps a fixed LCG, so a
+// click sequence is reproducible.
+
+
+
+const VERSION = "1.0.0";
+const state = { cfg: { ...DEFAULT_CONFIG }, row: 0 };
+let last = null;
+function lcgStep(seed) {
+    return (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff;
+}
+function css() {
+    return `
+  body{margin:0;background:#f7f6f1;color:#252524;font-family:Georgia,'Times New Roman',serif;}
+  .al{max-width:1180px;margin:0 auto;padding:36px 36px 26px;}
+  .al h1{font-size:27px;margin:0 0 5px;font-weight:600;}
+  .al .meta{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:10.5px;letter-spacing:.12em;color:#676662;text-transform:uppercase;margin-bottom:24px;}
+  .al .cols{display:grid;grid-template-columns:252px 1fr;gap:22px;align-items:start;}
+  .panel{background:#fff;border:1px solid #dcdad1;border-radius:10px;padding:16px;box-shadow:0 1px 2px rgba(37,37,36,.06);}
+  .panel h2{font-size:14px;margin:0 0 12px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#676662;}
+  .ctl{margin-bottom:13px;}
+  .ctl label{display:block;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;color:#676662;margin-bottom:4px;text-transform:uppercase;letter-spacing:.05em;}
+  .ctl select,.ctl input[type=number]{width:100%;box-sizing:border-box;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;padding:5px 7px;border:1px solid #dcdad1;border-radius:7px;background:#fff;color:#252524;}
+  .ctl input[type=range]{width:100%;accent-color:#5b51c7;}
+  .ctl .val{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#252524;}
+  .chk{display:flex;align-items:center;gap:8px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;}
+  .chk input{accent-color:#5b51c7;}
+  .btn{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;padding:6px 12px;border:1px solid #5b51c7;background:#5b51c7;color:#fff;border-radius:7px;cursor:pointer;}
+  .btn:hover{background:#4a41b0;}
+  .tokens{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:16px;}
+  .tok{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;padding:4px 10px;border-radius:999px;color:#fff;cursor:pointer;border:2px solid transparent;}
+  .tok.sel{border-color:#252524;}
+  .heads{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;}
+  .head{background:#fff;border:1px solid #dcdad1;border-radius:10px;padding:14px;box-shadow:0 1px 2px rgba(37,37,36,.06);}
+  .head h3{margin:0 0 2px;font-size:14.5px;font-weight:600;}
+  .head .stat{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;color:#676662;margin-bottom:8px;}
+  .head svg{display:block;max-width:100%;height:auto;}
+  .trace .stat{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;color:#676662;margin:0 0 8px;}
+  .foot{margin-top:26px;padding-top:13px;border-top:1px solid #dcdad1;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:10.5px;color:#676662;}
+  `;
+}
+function controlHTML(cfg) {
+    const sel = (v) => (v ? " selected" : "");
+    return `
+  <div class="ctl"><label>Scenario</label><select id="al-scenario">
+    ${SCENARIOS.map((s) => `<option value="${s.name}"${sel(s.name === cfg.scenario)}>${s.name}</option>`).join("")}
+  </select></div>
+  <div class="ctl"><label>Preset</label><select id="al-preset">
+    <option value="structured"${sel(cfg.preset === "structured")}>structured (designed heads)</option>
+    <option value="random"${sel(cfg.preset === "random")}>random (seeded baseline)</option>
+  </select></div>
+  <div class="ctl"><label>Heads — <span class="val" id="al-heads-v">${cfg.heads}</span></label>
+    <input type="range" id="al-heads" min="1" max="4" step="1" value="${cfg.heads}"></div>
+  <div class="ctl"><label>Head dim — <span class="val" id="al-hd-v">${cfg.headDim}</span></label>
+    <input type="range" id="al-hd" min="4" max="16" step="1" value="${cfg.headDim}"></div>
+  <div class="ctl"><label>Temperature — <span class="val" id="al-t-v">${cfg.temperature.toFixed(2)}</span></label>
+    <input type="range" id="al-t" min="0.25" max="4" step="0.25" value="${cfg.temperature}"></div>
+  <div class="ctl"><div class="chk"><input type="checkbox" id="al-causal"${cfg.causal ? " checked" : ""}><label for="al-causal" style="margin:0;">causal mask</label></div></div>
+  <div class="ctl"><label>Seed</label>
+    <div style="display:flex;gap:7px;"><input type="number" id="al-seed" value="${cfg.seed}">
+    <button class="btn" id="al-dice" title="deterministic LCG step — never Math.random" style="white-space:nowrap;">step</button></div></div>
+  <div style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:10.5px;color:#9a9994;line-height:1.6;margin-top:6px;">
+  every control change recomputes the full forward pass. same config + seed ⇒ identical matrices.</div>`;
+}
+function render(r, row) {
+    const heads = r.plans
+        .map((p, h) => {
+        const w = r.multi.perHead[h].weights;
+        const pk = r.peaks[h];
+        const svg = heatmapSVG(w, r.tokens, {
+            cell: 34,
+            causal: r.cfg.causal,
+            labels: true,
+            fontSize: 10,
+            selectedRow: row,
+            rowClick: (i) => `Attnlab.selectRow(${i})`,
+        });
+        return `<div class="head">
+        <h3>head ${h} · ${p.name}${p.kind === "random" ? " (seeded)" : ""}</h3>
+        <div class="stat">entropy ${r.entropies[h].toFixed(2)} nats · peak ${pk.value.toFixed(3)} @ ${pk.row}→${pk.col}</div>
+        ${svg}
+      </div>`;
+    })
+        .join("\n");
+    const traceVals = [];
+    for (let j = 0; j < r.n; j++)
+        traceVals.push(get(r.multi.perHead[0].weights, row, j));
+    return `
+  <div class="tokens">
+    ${r.tokens
+        .map((t, i) => `<span class="tok${i === row ? " sel" : ""}" style="background:${tokenColor(r.typeOf[i])}" onclick="Attnlab.selectRow(${i})">${i + 1} · ${t}</span>`)
+        .join("")}
+  </div>
+  <div class="heads">${heads}</div>
+  <div class="head trace" style="margin-top:16px;">
+    <h3>query ${row} · “${r.tokens[row]}” — head 0 attention over keys</h3>
+    <div class="stat">click any token or heatmap row to re-point the query</div>
+    ${barsSVG(traceVals, r.tokens, "#5b51c7")}
+  </div>`;
+}
+function refresh() {
+    if (typeof document === "undefined")
+        return; // no DOM (node tests)
+    const r = forward(state.cfg);
+    last = r;
+    const stage = document.getElementById("al-stage");
+    const ctrls = document.getElementById("al-ctrl");
+    if (!stage || !ctrls)
+        return;
+    stage.innerHTML = render(r, Math.min(state.row, r.n - 1));
+    ctrls.innerHTML = controlHTML(state.cfg);
+    wireControls();
+}
+function wireControls() {
+    const on = (id, fn) => {
+        const el = document.getElementById(id);
+        if (el)
+            el.addEventListener("input", () => fn(el));
+    };
+    on("al-scenario", (el) => { state.cfg.scenario = el.value; refresh(); });
+    on("al-preset", (el) => { state.cfg.preset = el.value; refresh(); });
+    on("al-heads", (el) => { state.cfg.heads = Number(el.value); refresh(); });
+    on("al-hd", (el) => { state.cfg.headDim = Number(el.value); refresh(); });
+    on("al-t", (el) => { state.cfg.temperature = Number(el.value); refresh(); });
+    on("al-causal", (el) => { state.cfg.causal = el.checked; refresh(); });
+    on("al-seed", (el) => { state.cfg.seed = Number(el.value); refresh(); });
+    const dice = document.getElementById("al-dice");
+    if (dice)
+        dice.addEventListener("click", () => { state.cfg.seed = lcgStep(state.cfg.seed); refresh(); });
+}
+function init() {
+    if (typeof document === "undefined")
+        return; // no DOM (node tests)
+    const app = document.getElementById("al-root");
+    if (!app)
+        return;
+    const st = document.createElement("style");
+    st.textContent = css();
+    document.head.appendChild(st);
+    app.innerHTML = `
+  <div class="al">
+    <h1>Attnlab</h1>
+    <div class="meta">real multi-head attention · computed live in your browser · hand-rolled matrix code · zero dependencies</div>
+    <div class="cols">
+      <div class="panel" id="al-ctrl"></div>
+      <div id="al-stage"></div>
+    </div>
+    <div class="foot">attnlab v${VERSION} · softmax(QKᵀ/(√d·T))·V · deterministic — same config + seed ⇒ identical matrices · MIT © 2026 adithyanraj03</div>
+  </div>`;
+    refresh();
+}
+const Attnlab = {
+    version: VERSION,
+    state,
+    init,
+    refresh,
+    selectRow(i) {
+        state.row = i;
+        if (last && typeof document !== "undefined") {
+            const stage = document.getElementById("al-stage");
+            if (stage)
+                stage.innerHTML = render(last, i);
+        }
+    },
+    _last: () => last,
+    _lcgStep: lcgStep,
+};
+if (typeof window !== "undefined") {
+    window.Attnlab = Attnlab;
+}
+
+
+if (typeof document !== "undefined") {
+  const __run = () => Attnlab.init();
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", __run);
+  else __run();
+}
+</script>
+</body>
+</html>
